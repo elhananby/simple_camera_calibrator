@@ -376,12 +376,13 @@ class CameraCalibrator:
             return
 
         # Create calibrations directory if it doesn't exist
-        calib_dir = Path("calibrations")
+        calib_dir = Path("results")
         calib_dir.mkdir(exist_ok=True)
 
         # Generate filename with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = calib_dir / f"camera_calibration_{timestamp}.yaml"
+        # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        camera_serial = self.camera.GetDeviceInfo().GetSerialNumber()
+        filename = calib_dir / f"Basler-{camera_serial}.yaml"
 
         camera_matrix = calibration_data['camera_matrix']
         dist_coeffs = calibration_data['dist_coeffs']
