@@ -7,12 +7,14 @@ import cv2
 import numpy as np
 from pypylon import pylon
 import sys
+import tomllib
+import time
 from datetime import datetime
 from pathlib import Path
 
 
 class CameraCalibrator:
-    def __init__(self):
+    def __init__(self, config_path="config.toml"):
         self.camera = None
         self.converter = pylon.ImageFormatConverter()
         self.converter.OutputPixelFormat = pylon.PixelType_BGR8packed
@@ -23,14 +25,57 @@ class CameraCalibrator:
         self.image_points = []   # 2D points in image plane
         self.image_size = None
 
-        # Checkerboard configuration (can be modified)
-        self.checkerboard_size = (9, 6)  # inner corners
-        self.square_size = 0.025  # 25mm squares
+        # Load configuration from TOML file
+        self.load_config(config_path)
 
-        # Camera parameters
-        self.fps = 30
-        self.gain = 0
-        self.exposure = 10000  # microseconds
+        # Auto-capture state
+        self.last_capture_time = 0
+
+    def load_config(self, config_path):
+        """Load configuration from TOML file."""
+        config_file = Path(config_path)
+
+        if not config_file.exists():
+            print(f"Warning: Config file '{config_path}' not found, using defaults")
+            # Set default values
+            self.fps = 10.0
+            self.gain = 0.0
+            self.exposure = 10000
+            self.checkerboard_size = (8, 6)
+            self.square_size = 0.025
+            self.auto_capture = True
+            self.capture_interval = 1.0
+            self.max_images = 0
+            self.min_quality = 0.5
+            return
+
+        with open(config_file, 'rb') as f:
+            config = tomllib.load(f)
+
+        # Load camera parameters
+        self.fps = config.get('camera', {}).get('fps', 10.0)
+        self.gain = config.get('camera', {}).get('gain', 0.0)
+        self.exposure = config.get('camera', {}).get('exposure', 10000)
+
+        # Load checkerboard configuration
+        checkerboard = config.get('checkerboard', {})
+        cols = checkerboard.get('columns', 8)
+        rows = checkerboard.get('rows', 6)
+        self.checkerboard_size = (cols, rows)
+        self.square_size = checkerboard.get('square_size', 0.025)
+
+        # Load capture settings
+        capture = config.get('capture', {})
+        self.auto_capture = capture.get('auto_capture', True)
+        self.capture_interval = capture.get('capture_interval', 1.0)
+        self.max_images = capture.get('max_images', 0)
+        self.min_quality = capture.get('min_quality', 0.5)
+
+        print(f"\nConfiguration loaded from {config_path}")
+        print(f"Camera: {self.fps} FPS, {self.gain} dB gain, {self.exposure} µs exposure")
+        print(f"Checkerboard: {self.checkerboard_size[0]}x{self.checkerboard_size[1]}, {self.square_size}m squares")
+        print(f"Auto-capture: {self.auto_capture}, interval: {self.capture_interval}s, max: {self.max_images if self.max_images > 0 else 'unlimited'}")
+        print(f"Quality threshold: {self.min_quality}")
 
     def discover_cameras(self):
         """Discover all available Basler cameras."""
@@ -67,65 +112,6 @@ class CameraCalibrator:
                 print("\nExiting...")
                 sys.exit(0)
 
-    def configure_camera_params(self):
-        """Allow user to configure camera parameters."""
-        print("\n" + "="*60)
-        print("Camera Parameters Configuration")
-        print("="*60)
-        print("Press Enter to use default values shown in brackets")
-        print()
-
-        # FPS
-        fps_input = input(f"Frame rate (FPS) [{self.fps}]: ").strip()
-        if fps_input:
-            try:
-                self.fps = float(fps_input)
-            except ValueError:
-                print(f"Invalid value, using default: {self.fps}")
-
-        # Gain
-        gain_input = input(f"Gain (dB) [{self.gain}]: ").strip()
-        if gain_input:
-            try:
-                self.gain = float(gain_input)
-            except ValueError:
-                print(f"Invalid value, using default: {self.gain}")
-
-        # Exposure
-        exposure_input = input(f"Exposure (microseconds) [{self.exposure}]: ").strip()
-        if exposure_input:
-            try:
-                self.exposure = int(exposure_input)
-            except ValueError:
-                print(f"Invalid value, using default: {self.exposure}")
-
-        # Checkerboard parameters
-        print("\n" + "-"*60)
-        print("Checkerboard Configuration")
-        print("-"*60)
-
-        cols_input = input(f"Checkerboard columns (inner corners) [{self.checkerboard_size[0]}]: ").strip()
-        if cols_input:
-            try:
-                cols = int(cols_input)
-                rows_input = input(f"Checkerboard rows (inner corners) [{self.checkerboard_size[1]}]: ").strip()
-                rows = int(rows_input) if rows_input else self.checkerboard_size[1]
-                self.checkerboard_size = (cols, rows)
-            except ValueError:
-                print(f"Invalid value, using default: {self.checkerboard_size}")
-
-        square_input = input(f"Square size (meters) [{self.square_size}]: ").strip()
-        if square_input:
-            try:
-                self.square_size = float(square_input)
-            except ValueError:
-                print(f"Invalid value, using default: {self.square_size}")
-
-        print("\nConfiguration complete!")
-        print(f"FPS: {self.fps}, Gain: {self.gain} dB, Exposure: {self.exposure} µs")
-        print(f"Checkerboard: {self.checkerboard_size[0]}x{self.checkerboard_size[1]}, Square: {self.square_size}m")
-        print()
-
     def initialize_camera(self, device):
         """Initialize and configure the selected camera."""
         self.camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateDevice(device))
@@ -160,6 +146,48 @@ class CameraCalibrator:
         objp *= self.square_size
         return objp
 
+    def calculate_image_quality(self, gray, corners):
+        """
+        Calculate quality metric for captured image.
+        Returns a score from 0.0 to 1.0, where higher is better.
+        Based on sharpness (Laplacian variance) around detected corners.
+        """
+        if corners is None or len(corners) == 0:
+            return 0.0
+
+        # Calculate Laplacian variance (sharpness measure) around corners
+        sharpness_scores = []
+        window_size = 50  # pixels around each corner to analyze
+
+        for corner in corners:
+            x, y = int(corner[0][0]), int(corner[0][1])
+
+            # Extract region around corner
+            y1 = max(0, y - window_size // 2)
+            y2 = min(gray.shape[0], y + window_size // 2)
+            x1 = max(0, x - window_size // 2)
+            x2 = min(gray.shape[1], x + window_size // 2)
+
+            roi = gray[y1:y2, x1:x2]
+
+            if roi.size > 0:
+                # Calculate Laplacian variance (edge sharpness)
+                laplacian = cv2.Laplacian(roi, cv2.CV_64F)
+                variance = laplacian.var()
+                sharpness_scores.append(variance)
+
+        if not sharpness_scores:
+            return 0.0
+
+        # Average sharpness score
+        avg_sharpness = np.mean(sharpness_scores)
+
+        # Normalize to 0-1 range (typical good values are 100-1000+)
+        # Values below 100 are usually blurry
+        normalized_score = min(1.0, max(0.0, (avg_sharpness - 50) / 500))
+
+        return normalized_score
+
     def run_calibration(self):
         """Main calibration loop with live video display."""
         print("\n" + "="*60)
@@ -167,7 +195,13 @@ class CameraCalibrator:
         print("="*60)
         print("Instructions:")
         print("  - Move checkerboard in front of the camera")
-        print("  - Press SPACE to capture an image when corners are detected")
+        if self.auto_capture:
+            print("  - Images will be captured automatically when checkerboard is detected")
+            print(f"  - Capture interval: {self.capture_interval}s, Quality threshold: {self.min_quality}")
+            if self.max_images > 0:
+                print(f"  - Will capture up to {self.max_images} images")
+        else:
+            print("  - Press SPACE to capture an image when corners are detected")
         print("  - Press 'q' or ESC to finish and compute calibration")
         print("  - Press 'r' to reset and clear all captured images")
         print("="*60)
@@ -196,33 +230,85 @@ class CameraCalibrator:
 
                     # Draw corners if found
                     display_img = img.copy()
+                    quality_score = 0.0
+                    should_auto_capture = False
+
                     if ret:
                         # Refine corner positions
                         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
                         corners_refined = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
                         cv2.drawChessboardCorners(display_img, self.checkerboard_size, corners_refined, ret)
 
-                        # Display instruction
-                        cv2.putText(display_img, "Press SPACE to capture", (10, 30),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        # Calculate quality score
+                        quality_score = self.calculate_image_quality(gray, corners_refined)
+
+                        # Check if we should auto-capture
+                        current_time = time.time()
+                        time_since_last = current_time - self.last_capture_time
+                        max_not_reached = (self.max_images == 0 or captured_count < self.max_images)
+
+                        should_auto_capture = (
+                            self.auto_capture and
+                            quality_score >= self.min_quality and
+                            time_since_last >= self.capture_interval and
+                            max_not_reached
+                        )
+
+                        # Display status
+                        if self.auto_capture:
+                            status_color = (0, 255, 0) if should_auto_capture else (255, 255, 0)
+                            status_text = f"Quality: {quality_score:.2f}"
+                            if should_auto_capture:
+                                status_text += " - CAPTURING"
+                            elif quality_score < self.min_quality:
+                                status_text += f" (need {self.min_quality:.2f})"
+                            elif time_since_last < self.capture_interval:
+                                status_text += f" (wait {self.capture_interval - time_since_last:.1f}s)"
+                            cv2.putText(display_img, status_text, (10, 30),
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+                        else:
+                            cv2.putText(display_img, f"Press SPACE to capture (Q:{quality_score:.2f})", (10, 30),
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                     else:
                         cv2.putText(display_img, "Checkerboard not detected", (10, 30),
                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
                     # Display capture count
-                    cv2.putText(display_img, f"Captured: {captured_count}", (10, 60),
+                    count_text = f"Captured: {captured_count}"
+                    if self.max_images > 0:
+                        count_text += f"/{self.max_images}"
+                    cv2.putText(display_img, count_text, (10, 60),
                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
                     cv2.imshow('Camera Calibration', display_img)
 
-                    # Handle keyboard input
-                    key = cv2.waitKey(1) & 0xFF
-
-                    if key == ord(' ') and ret:  # Space bar - capture
+                    # Auto-capture if conditions are met
+                    if should_auto_capture:
                         self.object_points.append(objp)
                         self.image_points.append(corners_refined)
                         captured_count += 1
-                        print(f"Captured image {captured_count}")
+                        self.last_capture_time = time.time()
+                        print(f"Auto-captured image {captured_count} (quality: {quality_score:.2f})")
+
+                        # Flash feedback
+                        flash = np.ones_like(display_img) * 255
+                        cv2.imshow('Camera Calibration', flash)
+                        cv2.waitKey(100)
+
+                        # Check if we've reached max images
+                        if self.max_images > 0 and captured_count >= self.max_images:
+                            print(f"\nReached maximum number of images ({self.max_images})")
+                            break
+
+                    # Handle keyboard input
+                    key = cv2.waitKey(1) & 0xFF
+
+                    if key == ord(' ') and ret:  # Space bar - manual capture (always available)
+                        self.object_points.append(objp)
+                        self.image_points.append(corners_refined)
+                        captured_count += 1
+                        self.last_capture_time = time.time()
+                        print(f"Manually captured image {captured_count} (quality: {quality_score:.2f})")
 
                         # Flash feedback
                         flash = np.ones_like(display_img) * 255
@@ -233,6 +319,7 @@ class CameraCalibrator:
                         self.object_points = []
                         self.image_points = []
                         captured_count = 0
+                        self.last_capture_time = 0
                         print("Reset: All captured images cleared")
 
                     elif key == ord('q') or key == 27:  # q or ESC - quit
@@ -352,9 +439,6 @@ def main():
 
     # Select camera
     selected_device = calibrator.select_camera(devices)
-
-    # Configure parameters
-    calibrator.configure_camera_params()
 
     # Initialize camera
     calibrator.initialize_camera(selected_device)

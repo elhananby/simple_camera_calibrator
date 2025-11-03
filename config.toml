@@ -1,0 +1,25 @@
+# Camera Calibration Configuration
+
+[camera]
+# Camera acquisition parameters
+fps = 10.0
+gain = 0.0  # dB
+exposure = 10000  # microseconds
+
+[checkerboard]
+# Checkerboard dimensions (inner corners, not squares)
+# For example, a 10x7 checkerboard has 9x6 inner corners
+columns = 8
+rows = 6
+square_size = 0.025  # meters (0.025m = 25mm)
+
+[capture]
+# Auto-capture settings
+auto_capture = true
+# Minimum time between auto-captures (seconds)
+capture_interval = 1.0
+# Maximum number of images to auto-capture (0 = unlimited)
+max_images = 0
+# Minimum quality threshold for auto-capture (0.0-1.0)
+# Higher values are more strict. Recommended: 0.5-0.8
+min_quality = 0.8
